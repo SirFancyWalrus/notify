@@ -606,23 +606,33 @@ mod tests {
 
     use super::*;
 
-    /// The server waits without a timeout, so an action whose sender forgets to wake it is
-    /// never processed. `configure` blocks on the answer, so it would hang.
+    /// The server waits without a timeout, so an action sent without waking it is never
+    /// served, and `watch` and `configure` block on their answers. Each runs while the
+    /// server is idle, on a helper thread, so a missing wake fails the test, naming the
+    /// call, instead of hanging the suite.
     #[test]
-    fn configure_returns_while_the_server_is_idle() {
-        let dir = std::env::temp_dir();
-        let mut watcher = ReadDirectoryChangesWatcher::new(|_| {}, Config::default()).unwrap();
-        watcher.watch(&dir, RecursiveMode::NonRecursive).unwrap();
-        // Let the server reach its wait.
-        thread::sleep(Duration::from_millis(200));
-
-        let (tx, rx) = mpsc::channel();
+    fn actions_are_served_while_the_server_is_idle() {
+        let (done_tx, done_rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(watcher.configure(Config::default()));
+            // Let the server reach its wait.
+            let idle = || thread::sleep(Duration::from_millis(200));
+            let mut watcher = ReadDirectoryChangesWatcher::new(|_| {}, Config::default()).unwrap();
+            idle();
+            watcher
+                .watch(&std::env::temp_dir(), RecursiveMode::NonRecursive)
+                .unwrap();
+            let _ = done_tx.send("watch");
+            idle();
+            assert!(matches!(watcher.configure(Config::default()), Ok(false)));
+            let _ = done_tx.send("configure");
         });
-        let result = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("configure() did not return: the server was not woken");
-        assert!(matches!(result, Ok(false)));
+        for call in ["watch", "configure"] {
+            let done = done_rx.recv_timeout(Duration::from_secs(5));
+            assert_eq!(
+                done,
+                Ok(call),
+                "{call}() did not return: the server was not woken"
+            );
+        }
     }
 }
