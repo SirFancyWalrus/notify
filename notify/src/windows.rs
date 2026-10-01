@@ -150,8 +150,11 @@ impl ReadDirectoryChangesServer {
             }
 
             unsafe {
-                // wait with alertable flag so that the completion routine fires
-                let waitres = WaitForSingleObjectEx(self.wakeup_sem, 100, 1);
+                // wait with alertable flag so that the completion routine fires. Every
+                // action sender releases `wakeup_sem` after queueing, and an APC (including
+                // one that queues an unwatch) ends the wait too, so no timeout is needed:
+                // an idle watcher never wakes.
+                let waitres = WaitForSingleObjectEx(self.wakeup_sem, INFINITE, 1);
                 if waitres == WAIT_OBJECT_0 {
                     let _ = self.meta_tx.send(MetaEvent::WatcherAwakened);
                 }
@@ -494,9 +497,8 @@ impl ReadDirectoryChangesWatcher {
     }
 
     fn wakeup_server(&mut self) {
-        // breaks the server out of its wait state.  right now this is really just an optimization,
-        // so that if you add a watch you don't block for 100ms in watch() while the
-        // server sleeps.
+        // breaks the server out of its wait state. The server waits without a timeout, so
+        // every action sent to it must be followed by this call.
         unsafe {
             ReleaseSemaphore(self.wakeup_sem, 1, ptr::null_mut());
         }
@@ -579,6 +581,7 @@ impl Watcher for ReadDirectoryChangesWatcher {
     fn configure(&mut self, config: Config) -> Result<bool> {
         let (tx, rx) = bounded(1);
         self.tx.send(Action::Configure(config, tx))?;
+        self.wakeup_server();
         rx.recv()?
     }
 
