@@ -57,6 +57,8 @@ struct ReadDirectoryRequest {
 
 impl ReadDirectoryRequest {
     fn unwatch(&self) {
+        // No wake needed: this runs in the completion routine, on the server thread, which
+        // checks its queue as soon as the routine returns.
         let _ = self.action_tx.send(Action::Unwatch(self.data.dir.clone()));
     }
 }
@@ -496,21 +498,23 @@ impl ReadDirectoryChangesWatcher {
         })
     }
 
-    fn wakeup_server(&mut self) {
-        // breaks the server out of its wait state. The server waits without a timeout, so
-        // every action sent to it must be followed by this call.
+    /// Queues `action` for the server and wakes it. The server waits without a timeout, so
+    /// an action queued without the wake would never be served: send every action through
+    /// here. (The completion routine's own unwatch is the exception: it runs on the server
+    /// thread, which checks its queue as soon as the routine returns.)
+    fn send_action(&mut self, action: Action) -> Result<()> {
+        let sent = self
+            .tx
+            .send(action)
+            .map_err(|_| Error::generic("Error sending to internal channel"));
         unsafe {
             ReleaseSemaphore(self.wakeup_sem, 1, ptr::null_mut());
         }
+        sent
     }
 
     fn send_action_require_ack(&mut self, action: Action, pb: &PathBuf) -> Result<()> {
-        self.tx
-            .send(action)
-            .map_err(|_| Error::generic("Error sending to internal channel"))?;
-
-        // wake 'em up, we don't want to wait around for the ack
-        self.wakeup_server();
+        self.send_action(action)?;
 
         let ack_pb = self
             .cmd_rx
@@ -552,12 +556,7 @@ impl ReadDirectoryChangesWatcher {
             let p = env::current_dir().map_err(Error::io)?;
             p.join(path)
         };
-        let res = self
-            .tx
-            .send(Action::Unwatch(pb))
-            .map_err(|_| Error::generic("Error sending to internal channel"));
-        self.wakeup_server();
-        res
+        self.send_action(Action::Unwatch(pb))
     }
 }
 
@@ -580,8 +579,7 @@ impl Watcher for ReadDirectoryChangesWatcher {
 
     fn configure(&mut self, config: Config) -> Result<bool> {
         let (tx, rx) = bounded(1);
-        self.tx.send(Action::Configure(config, tx))?;
-        self.wakeup_server();
+        self.send_action(Action::Configure(config, tx))?;
         rx.recv()?
     }
 
@@ -592,9 +590,7 @@ impl Watcher for ReadDirectoryChangesWatcher {
 
 impl Drop for ReadDirectoryChangesWatcher {
     fn drop(&mut self) {
-        let _ = self.tx.send(Action::Stop);
-        // better wake it up
-        self.wakeup_server();
+        let _ = self.send_action(Action::Stop);
     }
 }
 
