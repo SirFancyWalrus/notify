@@ -603,3 +603,30 @@ impl Drop for ReadDirectoryChangesWatcher {
 unsafe impl Send for ReadDirectoryChangesWatcher {}
 // Because all public methods are `&mut self` it's also perfectly safe to share references.
 unsafe impl Sync for ReadDirectoryChangesWatcher {}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::mpsc, time::Duration};
+
+    use super::*;
+
+    /// The server waits without a timeout, so an action whose sender forgets to wake it is
+    /// never processed. `configure` blocks on the answer, so it would hang.
+    #[test]
+    fn configure_returns_while_the_server_is_idle() {
+        let dir = std::env::temp_dir();
+        let mut watcher = ReadDirectoryChangesWatcher::new(|_| {}, Config::default()).unwrap();
+        watcher.watch(&dir, RecursiveMode::NonRecursive).unwrap();
+        // Let the server reach its wait.
+        thread::sleep(Duration::from_millis(200));
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(watcher.configure(Config::default()));
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("configure() did not return: the server was not woken");
+        assert!(matches!(result, Ok(false)));
+    }
+}
