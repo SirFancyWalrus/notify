@@ -76,6 +76,35 @@ pub enum MetaEvent {
     WatcherAwakened,
 }
 
+/// The wakeup semaphore, shared by the watcher and its server thread. Either can outlive the
+/// other: the server stops when the watcher drops, but the watcher still wakes it after
+/// queueing `Stop`. The handle closes when the last owner drops, so neither side can
+/// release a handle the other has already closed (or one Windows has reused since).
+#[derive(Debug)]
+struct WakeupSemaphore(HANDLE);
+
+impl WakeupSemaphore {
+    fn new() -> Result<Arc<Self>> {
+        let sem = unsafe { CreateSemaphoreW(ptr::null_mut(), 0, 1, ptr::null_mut()) };
+        if sem.is_null() || sem == INVALID_HANDLE_VALUE {
+            return Err(Error::generic("Failed to create wakeup semaphore."));
+        }
+        Ok(Arc::new(WakeupSemaphore(sem)))
+    }
+}
+
+impl Drop for WakeupSemaphore {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+// A semaphore handle may be used from any thread.
+unsafe impl Send for WakeupSemaphore {}
+unsafe impl Sync for WakeupSemaphore {}
+
 struct WatchState {
     dir_handle: HANDLE,
     complete_sem: HANDLE,
@@ -88,7 +117,7 @@ struct ReadDirectoryChangesServer {
     meta_tx: Sender<MetaEvent>,
     cmd_tx: Sender<Result<PathBuf>>,
     watches: HashMap<PathBuf, WatchState>,
-    wakeup_sem: HANDLE,
+    wakeup_sem: Arc<WakeupSemaphore>,
 }
 
 impl ReadDirectoryChangesServer {
@@ -96,17 +125,14 @@ impl ReadDirectoryChangesServer {
         event_handler: Arc<Mutex<dyn EventHandler>>,
         meta_tx: Sender<MetaEvent>,
         cmd_tx: Sender<Result<PathBuf>>,
-        wakeup_sem: HANDLE,
+        wakeup_sem: Arc<WakeupSemaphore>,
     ) -> Sender<Action> {
         let (action_tx, action_rx) = unbounded();
-        // it is, in fact, ok to send the semaphore across threads
-        let sem_temp = wakeup_sem as u64;
         let _ = thread::Builder::new()
             .name("notify-rs windows loop".to_string())
             .spawn({
                 let tx = action_tx.clone();
                 move || {
-                    let wakeup_sem = sem_temp as HANDLE;
                     let server = ReadDirectoryChangesServer {
                         tx,
                         rx: action_rx,
@@ -156,16 +182,11 @@ impl ReadDirectoryChangesServer {
                 // action sender releases `wakeup_sem` after queueing, and an APC (including
                 // one that queues an unwatch) ends the wait too, so no timeout is needed:
                 // an idle watcher never wakes.
-                let waitres = WaitForSingleObjectEx(self.wakeup_sem, INFINITE, 1);
+                let waitres = WaitForSingleObjectEx(self.wakeup_sem.0, INFINITE, 1);
                 if waitres == WAIT_OBJECT_0 {
                     let _ = self.meta_tx.send(MetaEvent::WatcherAwakened);
                 }
             }
-        }
-
-        // we have to clean this up, since the watcher may be long gone
-        unsafe {
-            CloseHandle(self.wakeup_sem);
         }
     }
 
@@ -473,7 +494,7 @@ unsafe extern "system" fn handle_event(
 pub struct ReadDirectoryChangesWatcher {
     tx: Sender<Action>,
     cmd_rx: Receiver<Result<PathBuf>>,
-    wakeup_sem: HANDLE,
+    wakeup_sem: Arc<WakeupSemaphore>,
 }
 
 impl ReadDirectoryChangesWatcher {
@@ -483,13 +504,10 @@ impl ReadDirectoryChangesWatcher {
     ) -> Result<ReadDirectoryChangesWatcher> {
         let (cmd_tx, cmd_rx) = unbounded();
 
-        let wakeup_sem = unsafe { CreateSemaphoreW(ptr::null_mut(), 0, 1, ptr::null_mut()) };
-        if wakeup_sem.is_null() || wakeup_sem == INVALID_HANDLE_VALUE {
-            return Err(Error::generic("Failed to create wakeup semaphore."));
-        }
+        let wakeup_sem = WakeupSemaphore::new()?;
 
         let action_tx =
-            ReadDirectoryChangesServer::start(event_handler, meta_tx, cmd_tx, wakeup_sem);
+            ReadDirectoryChangesServer::start(event_handler, meta_tx, cmd_tx, wakeup_sem.clone());
 
         Ok(ReadDirectoryChangesWatcher {
             tx: action_tx,
@@ -508,7 +526,7 @@ impl ReadDirectoryChangesWatcher {
             .send(action)
             .map_err(|_| Error::generic("Error sending to internal channel"));
         unsafe {
-            ReleaseSemaphore(self.wakeup_sem, 1, ptr::null_mut());
+            ReleaseSemaphore(self.wakeup_sem.0, 1, ptr::null_mut());
         }
         sent
     }
@@ -594,10 +612,9 @@ impl Drop for ReadDirectoryChangesWatcher {
     }
 }
 
-// `ReadDirectoryChangesWatcher` is not Send/Sync because of the semaphore Handle.
-// As said elsewhere it's perfectly safe to send it across threads.
+// The command receiver keeps `ReadDirectoryChangesWatcher` from being Sync on its own.
+// Because all public methods are `&mut self` it's perfectly safe to share references.
 unsafe impl Send for ReadDirectoryChangesWatcher {}
-// Because all public methods are `&mut self` it's also perfectly safe to share references.
 unsafe impl Sync for ReadDirectoryChangesWatcher {}
 
 #[cfg(test)]
@@ -634,5 +651,35 @@ mod tests {
                 "{call}() did not return: the server was not woken"
             );
         }
+    }
+
+    /// Dropping the watcher queues `Stop` and then wakes the server. A server that is
+    /// already awake can take `Stop` and exit in between, so the semaphore must outlive the
+    /// server's exit: here the server stops first, and the watcher's wake must still reach a
+    /// live handle rather than a closed (or since reused) one.
+    #[test]
+    fn the_wakeup_semaphore_outlives_the_server() {
+        use windows_sys::Win32::Foundation::WAIT_FAILED;
+
+        let (meta_tx, meta_rx) = unbounded();
+        let mut watcher = ReadDirectoryChangesWatcher::create(
+            Arc::new(Mutex::new(|_: Result<Event>| {})),
+            meta_tx,
+        )
+        .unwrap();
+        watcher.send_action(Action::Stop).unwrap();
+        // The server owns the only meta sender, so the channel disconnects once it has gone.
+        loop {
+            match meta_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(_) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => panic!("the server did not stop"),
+            }
+        }
+        let wait = unsafe { WaitForSingleObjectEx(watcher.wakeup_sem.0, 0, 0) };
+        assert_ne!(
+            wait, WAIT_FAILED,
+            "the server closed the wakeup semaphore the watcher still uses"
+        );
     }
 }
